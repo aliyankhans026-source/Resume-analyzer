@@ -6,6 +6,7 @@ improvements, powered by Google Gemini Flash and a Streamlit UI.
 import io
 import os
 import re
+import time
 from datetime import date
 
 import streamlit as st
@@ -21,6 +22,11 @@ from docx import Document
 # Gemini model names change often. Override with the GEMINI_MODEL secret /
 # environment variable or the sidebar field without touching the code.
 DEFAULT_MODEL = "gemini-3.6-flash"
+# Tried in order if the main model is overloaded (503). Override with the
+# GEMINI_FALLBACK_MODELS secret (comma separated). Unknown names are skipped.
+DEFAULT_FALLBACKS = ["gemini-3.5-flash", "gemini-2.5-flash"]
+MAX_RETRIES = 3          # attempts per model
+RETRY_BASE_DELAY = 2.0   # seconds; doubles each retry (2s, 4s)
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000
 MAX_JD_CHARS = 8_000
@@ -227,12 +233,18 @@ def overall_score(report: ATSReport) -> int:
     return clamp(total)
 
 
-def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str) -> ATSReport:
-    checks = quick_checks(resume_text)
-    client = genai.Client(api_key=api_key)
+def is_transient(exc: Exception) -> bool:
+    """True for temporary Google-side errors that are worth retrying (503 etc.)."""
+    if getattr(exc, "code", None) in (500, 503, 504):
+        return True
+    low = str(exc).lower()
+    return any(m in low for m in ("503", "504", "unavailable", "high demand", "overloaded", "deadline exceeded"))
+
+
+def _generate_report(client, model: str, prompt: str) -> ATSReport:
     response = client.models.generate_content(
         model=model,
-        contents=build_prompt(resume_text, job_description, checks),
+        contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
@@ -251,9 +263,45 @@ def analyze_resume(api_key: str, model: str, resume_text: str, job_description: 
     return ATSReport.model_validate_json(raw)
 
 
+def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str,
+                   fallback_models=None, retries: int = MAX_RETRIES,
+                   base_delay: float = RETRY_BASE_DELAY, sleep=time.sleep):
+    """Analyse the resume. Returns (report, model_actually_used).
+
+    Temporary errors (503 overloaded, etc.) are retried with exponential backoff, then the
+    fallback models are tried. Permanent errors on the main model (bad key, wrong model name)
+    are raised immediately.
+    """
+    checks = quick_checks(resume_text)
+    prompt = build_prompt(resume_text, job_description, checks)
+    client = genai.Client(api_key=api_key)
+
+    fallbacks = DEFAULT_FALLBACKS if fallback_models is None else fallback_models
+    models = [model] + [m for m in fallbacks if m and m != model]
+
+    last_transient = None
+    for m in models:
+        for attempt in range(retries):
+            try:
+                return _generate_report(client, m, prompt), m
+            except Exception as exc:
+                if is_transient(exc):
+                    last_transient = exc
+                    if attempt < retries - 1:
+                        sleep(base_delay * (2 ** attempt))
+                    continue
+                if m == model:
+                    raise          # main model: real problem, tell the user
+                break              # fallback model failed for another reason: try the next one
+    raise last_transient
+
+
 def friendly_error(exc: Exception) -> str:
     msg = str(exc)
     low = msg.lower()
+    if is_transient(exc):
+        return ("Gemini is overloaded right now. The app already retried and tried backup models. "
+                "Please wait a minute and click Analyze again, or pick a different model in the sidebar.")
     if "api key" in low or "api_key" in low or "permission_denied" in low or "401" in low or "403" in low:
         return "Your Gemini API key looks invalid or lacks permission. Check the key and try again."
     if "429" in low or "quota" in low or "resource_exhausted" in low:
@@ -439,17 +487,28 @@ def main() -> None:
                     st.warning("Very little text was extracted. If this is a scanned/image PDF, an ATS "
                                "cannot read it either. Use a text-based PDF or DOCX.")
                 try:
-                    with st.spinner("Analyzing your resume..."):
-                        report = analyze_resume(api_key, model.strip() or DEFAULT_MODEL, text, job_description)
-                    st.session_state["result"] = (report, checks)
+                    fallbacks = [m.strip() for m in
+                                 get_secret("GEMINI_FALLBACK_MODELS", ",".join(DEFAULT_FALLBACKS)).split(",")
+                                 if m.strip()]
+                    with st.spinner("Analyzing your resume... (retries automatically if Gemini is busy)"):
+                        report, used_model = analyze_resume(
+                            api_key, model.strip() or DEFAULT_MODEL, text, job_description,
+                            fallback_models=fallbacks)
+                    st.session_state["result"] = (report, checks, used_model)
                 except Exception as exc:
                     st.session_state.pop("result", None)
                     st.error(friendly_error(exc))
 
     if "result" in st.session_state:
-        report, checks = st.session_state["result"]
+        report, checks, used_model = st.session_state["result"]
         render_report(report, checks)
+        st.caption(f"Analyzed with {used_model}")
 
 
 if __name__ == "__main__":
     main()
+
+
+     
+
+  
