@@ -21,7 +21,7 @@ from docx import Document
 # --------------------------------------------------------------------------
 # Gemini model names change often. Override with the GEMINI_MODEL secret /
 # environment variable or the sidebar field without touching the code.
-DEFAULT_MODEL = "gemini-3.6-flash"
+DEFAULT_MODEL = "gemini-3.5-flash"
 # Tried in order if the main model is overloaded (503). Override with the
 # GEMINI_FALLBACK_MODELS secret (comma separated). Unknown names are skipped.
 DEFAULT_FALLBACKS = ["gemini-3.5-flash", "gemini-2.5-flash"]
